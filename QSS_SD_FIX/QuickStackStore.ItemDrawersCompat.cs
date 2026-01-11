@@ -1,184 +1,285 @@
 ﻿#nullable enable
 
 using System;
-using System.Collections;
 using System.Collections.Generic;
 using System.Linq;
 using System.Reflection;
 using BepInEx;
 using BepInEx.Configuration;
-using BepInEx.Logging;
 using HarmonyLib;
 using UnityEngine;
 
-namespace QuickStackStore.ItemDrawersCompat
+namespace QuickStackStoreItemDrawersCompat
 {
     [BepInPlugin(ModGuid, ModName, ModVersion)]
-    // ВАЖНО: правильный GUID QSS (у тебя в логе ConfigSync именно он)
     [BepInDependency("goldenrevolver.quick_stack_store", BepInDependency.DependencyFlags.HardDependency)]
-    public sealed class QssItemDrawersCompatPlugin : BaseUnityPlugin
+    [BepInDependency("kg.ItemDrawers", BepInDependency.DependencyFlags.SoftDependency)]
+    public sealed class QuickStackStoreItemDrawersCompatPlugin : BaseUnityPlugin
     {
-        public const string ModGuid = "gerbesh.QuickStackStore.ItemDrawersCompat";
-        public const string ModName = "QuickStackStore ItemDrawers Compat";
-        public const string ModVersion = "1.1.2"; // fixed: correct QSS guid + correct hook + logs + suppress QSS NRE
+        public const string ModGuid = "pavel.quickstackstore.itemdrawers_compat";
+        public const string ModName = "QSS - ItemDrawers Compat (UseItem, MP-safe)";
+        public const string ModVersion = "1.0.3";
 
-        private static ManualLogSource? Log;
-
-        private static ConfigEntry<float>? CfgSearchRadius;
-        private static ConfigEntry<bool>? CfgFillEmptyDrawers;
-        private static ConfigEntry<bool>? CfgDebug;
-        private static ConfigEntry<float>? CfgPlacementCheckDelay;
-
-        // ItemDrawers API
-        private static bool _drawersInstalled;
-        private static MethodInfo? _miAllDrawers; // List<ZNetView>
-
-        // QSS hooks
-        private static MethodInfo? _miReportQuickStackResult; // QuickStackStore.QuickStackModule.ReportQuickStackResult(Player,int)
-
-        // Safe clone (MemberwiseClone) for ItemDrop.ItemData
-        private static readonly MethodInfo? MemberwiseCloneMethod =
-            AccessTools.DeclaredMethod(typeof(object), "MemberwiseClone");
+        internal static ConfigEntry<float> SearchRadius = null!;
+        internal static ConfigEntry<bool> IncludeHotbar = null!;
+        internal static ConfigEntry<int> MaxDrawersToCheck = null!;
+        internal static ConfigEntry<bool> PreferQssRadiusIfAvailable = null!;
+        internal static ConfigEntry<bool> FillEmptyDrawers = null!;
+        internal static ConfigEntry<bool> DebugLogging = null!;
 
         private void Awake()
         {
-            Log = Logger;
-
-            CfgSearchRadius = Config.Bind(
+            SearchRadius = Config.Bind(
                 "General",
                 "SearchRadius",
-                15f,
-                "Radius (meters) to search ItemDrawers around the player.");
+                10f,
+                "Drawer search radius (meters). Used if PreferQssRadiusIfAvailable=false, or if QSS radius cannot be read.");
 
-            CfgFillEmptyDrawers = Config.Bind(
+            IncludeHotbar = Config.Bind(
+                "General",
+                "IncludeHotbar",
+                false,
+                "If true, quickstack will also move items from hotbar.");
+
+            MaxDrawersToCheck = Config.Bind(
+                "General",
+                "MaxDrawersToCheck",
+                200,
+                "Safety limit: max number of drawers to evaluate (nearest first).");
+
+            PreferQssRadiusIfAvailable = Config.Bind(
+                "General",
+                "PreferQssRadiusIfAvailable",
+                true,
+                "If true, tries to read QSS nearby-range config and use it instead of SearchRadius.");
+
+            FillEmptyDrawers = Config.Bind(
                 "General",
                 "FillEmptyDrawers",
                 false,
-                "If true, when no matching drawer exists, the mod may put items into ONE empty drawer (per item prefab + quality). If false, only drawers that already contain the item are used.");
+                "If false: only drawers that are already set to the same item will be used. If true: if no matching drawer exists, may place into empty drawers.");
 
-            CfgDebug = Config.Bind(
+            DebugLogging = Config.Bind(
                 "General",
                 "DebugLogging",
                 false,
-                "Enable verbose logs for troubleshooting.");
+                "Enable debug logging.");
 
-            CfgPlacementCheckDelay = Config.Bind(
-                "General",
-                "PlacementCheckDelay",
-                0.5f,
-                "Delay (seconds) before checking if the item was successfully placed in the drawer (to account for network latency).");
-
-            TryInitItemDrawersApi();
-
-            var h = new Harmony(ModGuid);
-            TryPatchQss(h);
-
-            // Доп-патч: гасим NRE в QSS SortModule.SortContainer(Container)
-            TryPatchQssSortNre(h);
-
-            h.PatchAll();
-
-            // Лог всегда, чтобы ты видел что мод реально загрузился
-            Log?.LogInfo($"[{ModName}] Loaded v{ModVersion}. DrawersInstalled={_drawersInstalled}. Hook={( _miReportQuickStackResult != null ? "OK" : "MISSING" )}");
+            Harmony.CreateAndPatchAll(Assembly.GetExecutingAssembly(), ModGuid);
+            Logger.LogInfo($"{ModName} v{ModVersion} loaded");
         }
 
-        private static void TryInitItemDrawersApi()
+        internal static void Dbg(string msg)
+        {
+            if (!DebugLogging.Value) return;
+            BepInEx.Logging.Logger.CreateLogSource(ModName).LogInfo("[QSS-DrawersCompat] " + msg);
+        }
+    }
+
+    [HarmonyPatch]
+    internal static class QssReportPatch
+    {
+        [HarmonyTargetMethod]
+        private static MethodBase? TargetMethod()
+        {
+            // QuickStackStore.QuickStackModule.ReportQuickStackResult(Player player, int movedCount)
+            var type = AccessTools.TypeByName("QuickStackStore.QuickStackModule");
+            return type == null ? null : AccessTools.Method(type, "ReportQuickStackResult", new[] { typeof(Player), typeof(int) });
+        }
+
+        [HarmonyPrefix]
+        private static void Prefix(Player player, ref int movedCount)
         {
             try
             {
-                var drawersApiType = Type.GetType("API.ClientSideV2, kg_ItemDrawers");
-                if (drawersApiType == null)
-                {
-                    _drawersInstalled = false;
-                    Log?.LogWarning("[ItemDrawersCompat] ItemDrawers API.ClientSideV2 not found. ItemDrawers not installed?");
-                    return;
-                }
+                if (player == null) return;
 
-                _miAllDrawers = drawersApiType.GetMethod("AllDrawers", BindingFlags.Public | BindingFlags.Static);
-                if (_miAllDrawers == null)
-                {
-                    _drawersInstalled = false;
-                    Log?.LogWarning("[ItemDrawersCompat] ItemDrawers API.ClientSideV2.AllDrawers not found.");
-                    return;
-                }
+                // Если ItemDrawers не стоит - ничего не делаем
+                if (AccessTools.TypeByName("kg_ItemDrawers.DrawerComponent") == null) return;
 
-                _drawersInstalled = true;
-                Dbg("ItemDrawers API initialized.");
+                int added = DrawerQuickStacker.TryQuickStackIntoNearbyDrawers(player);
+                if (added > 0) movedCount += added;
             }
-            catch (Exception ex)
+            catch (Exception e)
             {
-                _drawersInstalled = false;
-                Log?.LogError($"[ItemDrawersCompat] Failed to init ItemDrawers API: {ex}");
+                Debug.LogError($"[QSS-DrawersCompat] Error: {e}");
             }
         }
+    }
 
-        private static void TryPatchQss(Harmony h)
+    internal static class DrawerQuickStacker
+    {
+        private const string DrawerTypeName = "kg_ItemDrawers.DrawerComponent";
+
+        private static MethodInfo? _useItemMethod;
+
+        private static MethodInfo? _getInventoryMethod;
+        private static FieldInfo? _inventoryField;
+
+        private static PropertyInfo? _piCurrentPrefab;
+        private static PropertyInfo? _piCurrentAmount;
+
+        public static int TryQuickStackIntoNearbyDrawers(Player player)
+        {
+            var drawerType = AccessTools.TypeByName(DrawerTypeName);
+            if (drawerType == null) return 0;
+
+            _useItemMethod ??= AccessTools.Method(drawerType, "UseItem", new[] { typeof(Humanoid), typeof(ItemDrop.ItemData) });
+            if (_useItemMethod == null) return 0;
+
+            _piCurrentPrefab ??= AccessTools.Property(drawerType, "CurrentPrefab");
+            _piCurrentAmount ??= AccessTools.Property(drawerType, "CurrentAmount");
+
+            float range = GetEffectiveRange();
+            if (range <= 0.05f) return 0;
+
+            // Находим drawers
+            var all = UnityEngine.Object.FindObjectsByType(drawerType, FindObjectsSortMode.None);
+            if (all == null || all.Length == 0) return 0;
+
+            int maxDrawers = Math.Max(1, QuickStackStoreItemDrawersCompatPlugin.MaxDrawersToCheck.Value);
+
+            var drawerInfos = all
+                .Select(o => o as Component)
+                .Where(c => c != null && c.gameObject != null && c.gameObject.activeInHierarchy)
+                .Select(c => new DrawerInfo(c!, Vector3.Distance(player.transform.position, c!.transform.position), ReadCurrentPrefab(c!), ReadCurrentAmount(c!)))
+                .Where(x => x.Distance <= range)
+                .OrderBy(x => x.Distance)
+                .Take(maxDrawers)
+                .ToList();
+
+            if (drawerInfos.Count == 0) return 0;
+
+            QuickStackStoreItemDrawersCompatPlugin.Dbg($"Nearby drawers found: {drawerInfos.Count} (radius={range}, max={maxDrawers})");
+
+            // Берем inventory игрока
+            var inv = GetHumanoidInventory(player);
+            if (inv == null) return 0;
+
+            var items = inv.GetAllItems()?.ToList();
+            if (items == null || items.Count == 0) return 0;
+
+            bool includeHotbar = QuickStackStoreItemDrawersCompatPlugin.IncludeHotbar.Value;
+
+            // Кандидаты - не трогаем предметы с customData (важно для гемов/модов/перков)
+            var candidates = items
+                .Where(i => i != null)
+                .Where(i => i!.m_stack > 0)
+                .Where(i => includeHotbar || !IsHotbarItem(i!))
+                .Where(i => i!.m_customData == null || i.m_customData.Count == 0)
+                .Where(i => i!.m_dropPrefab != null && !string.IsNullOrWhiteSpace(i.m_dropPrefab.name))
+                .ToList();
+
+            if (candidates.Count == 0) return 0;
+
+            // Индексы drawers:
+            // 1) drawers, уже назначенные под конкретный prefab (CurrentPrefab)
+            // 2) пустые drawers (CurrentPrefab пустой или Amount==0) - опционально
+            var drawersByPrefab = new Dictionary<string, List<DrawerInfo>>(StringComparer.Ordinal);
+            var emptyDrawers = new List<DrawerInfo>();
+
+            foreach (var d in drawerInfos)
+            {
+                if (!string.IsNullOrEmpty(d.CurrentPrefab))
+                {
+                    if (!drawersByPrefab.TryGetValue(d.CurrentPrefab, out var list))
+                    {
+                        list = new List<DrawerInfo>();
+                        drawersByPrefab[d.CurrentPrefab] = list;
+                    }
+                    list.Add(d);
+                }
+                else
+                {
+                    emptyDrawers.Add(d);
+                }
+            }
+
+            // На всякий - сортируем внутри каждой группы по расстоянию
+            foreach (var kv in drawersByPrefab)
+                kv.Value.Sort((a, b) => a.Distance.CompareTo(b.Distance));
+            emptyDrawers.Sort((a, b) => a.Distance.CompareTo(b.Distance));
+
+            bool allowEmpty = QuickStackStoreItemDrawersCompatPlugin.FillEmptyDrawers.Value;
+
+            int movedStacks = 0;
+
+            foreach (var item in candidates)
+            {
+                if (item == null) continue;
+                if (!inv.ContainsItem(item)) continue;
+
+                string prefab = item.m_dropPrefab!.name;
+
+                bool movedThisStack = false;
+
+                // 1) Сначала только drawers, которые уже помечены этим prefab
+                if (drawersByPrefab.TryGetValue(prefab, out var matching) && matching.Count > 0)
+                {
+                    foreach (var drawer in matching)
+                    {
+                        if (TryUseItem(player, item, drawer.Comp))
+                        {
+                            movedStacks += 1;
+                            movedThisStack = true;
+                            break;
+                        }
+                    }
+                }
+
+                if (movedThisStack) continue;
+
+                // 2) Только если разрешено - используем пустые drawers
+                if (allowEmpty && emptyDrawers.Count > 0)
+                {
+                    foreach (var drawer in emptyDrawers)
+                    {
+                        if (TryUseItem(player, item, drawer.Comp))
+                        {
+                            movedStacks += 1;
+                            movedThisStack = true;
+
+                            // После успешного UseItem этот drawer станет "не пустым".
+                            // Обновим наши индексы, чтобы следующие стаки шли в него же, а не в другой пустой.
+                            string newPrefab = ReadCurrentPrefab(drawer.Comp);
+                            int newAmount = ReadCurrentAmount(drawer.Comp);
+
+                            if (!string.IsNullOrEmpty(newPrefab) && newAmount > 0)
+                            {
+                                emptyDrawers.Remove(drawer);
+
+                                if (!drawersByPrefab.TryGetValue(newPrefab, out var list))
+                                {
+                                    list = new List<DrawerInfo>();
+                                    drawersByPrefab[newPrefab] = list;
+                                }
+                                list.Add(new DrawerInfo(drawer.Comp, drawer.Distance, newPrefab, newAmount));
+                                list.Sort((a, b) => a.Distance.CompareTo(b.Distance));
+                            }
+
+                            break;
+                        }
+                    }
+                }
+            }
+
+            if (movedStacks > 0)
+                QuickStackStoreItemDrawersCompatPlugin.Dbg($"Moved stacks into drawers: {movedStacks}");
+
+            return movedStacks;
+        }
+
+        private static bool TryUseItem(Player player, ItemDrop.ItemData item, Component drawerComp)
         {
             try
             {
-                // В дампе QSS метод тут:
-                // namespace QuickStackStore
-                // public class QuickStackModule { public static void ReportQuickStackResult(Player player, int movedCount) }
-                var qssType = AccessTools.TypeByName("QuickStackStore.QuickStackModule");
-                if (qssType == null)
-                {
-                    Log?.LogError("[ItemDrawersCompat] QuickStackStore.QuickStackModule type not found. Is QSS installed / correct version?");
-                    return;
-                }
+                // MP-safe: если у объекта есть ZNetView - заберем ownership перед UseItem
+                var znv = drawerComp.GetComponent<ZNetView>();
+                if (znv != null && znv.IsValid())
+                    znv.ClaimOwnership();
 
-                _miReportQuickStackResult = AccessTools.Method(qssType, "ReportQuickStackResult", new[] { typeof(Player), typeof(int) });
-                if (_miReportQuickStackResult == null)
-                {
-                    Log?.LogError("[ItemDrawersCompat] QuickStackModule.ReportQuickStackResult(Player,int) not found. QSS version mismatch.");
-                    return;
-                }
-
-                h.Patch(
-                    original: _miReportQuickStackResult,
-                    postfix: new HarmonyMethod(typeof(QssItemDrawersCompatPlugin), nameof(ReportQuickStackResult_Postfix))
-                );
-
-                Log?.LogInfo("[ItemDrawersCompat] Patched QuickStackStore.QuickStackModule.ReportQuickStackResult(Player,int)");
-            }
-            catch (Exception ex)
-            {
-                Log?.LogError($"[ItemDrawersCompat] Failed to patch QSS: {ex}");
-            }
-        }
-
-        private static void TryPatchQssSortNre(Harmony h)
-        {
-            try
-            {
-                var sortType = AccessTools.TypeByName("QuickStackStore.SortModule");
-                if (sortType == null) return;
-
-                var miSortContainer = AccessTools.Method(sortType, "SortContainer", new[] { typeof(Container) });
-                if (miSortContainer == null) return;
-
-                h.Patch(
-                    original: miSortContainer,
-                    prefix: new HarmonyMethod(typeof(QssItemDrawersCompatPlugin), nameof(SortContainer_Prefix))
-                );
-
-                Log?.LogInfo("[ItemDrawersCompat] Patched QuickStackStore.SortModule.SortContainer(Container) to prevent NRE");
-            }
-            catch (Exception ex)
-            {
-                Log?.LogWarning($"[ItemDrawersCompat] Sort NRE patch failed (non-fatal): {ex.Message}");
-            }
-        }
-
-        // Гасим твой краш:
-        // NullReferenceException: QuickStackStore.SortModule.SortContainer(Container container)
-        public static bool SortContainer_Prefix(Container container)
-        {
-            try
-            {
-                if (container == null) return false;
-                var inv = container.GetInventory();
-                if (inv == null) return false;
-                return true; // продолжаем оригинальный метод
+                var okObj = _useItemMethod!.Invoke(drawerComp, new object[] { player, item });
+                return okObj is bool ok && ok;
             }
             catch
             {
@@ -186,383 +287,140 @@ namespace QuickStackStore.ItemDrawersCompat
             }
         }
 
-        // Сигнатура должна совпадать с ReportQuickStackResult(Player,int)
-        public static void ReportQuickStackResult_Postfix(Player __0, int __1)
+        private static float GetEffectiveRange()
         {
+            float fallback = Math.Max(0f, QuickStackStoreItemDrawersCompatPlugin.SearchRadius.Value);
+
+            if (!QuickStackStoreItemDrawersCompatPlugin.PreferQssRadiusIfAvailable.Value)
+                return fallback;
+
+            float qss = TryGetQssNearbyRangeOrNaN();
+            if (!float.IsNaN(qss) && qss > 0.05f) return qss;
+
+            return fallback;
+        }
+
+        private static float TryGetQssNearbyRangeOrNaN()
+        {
+            // QuickStackStore.QSSConfig+QuickStackConfig.QuickStackToNearbyRange.Value
             try
             {
-                if (!_drawersInstalled || _miAllDrawers == null)
-                    return;
+                var cfgType = AccessTools.TypeByName("QuickStackStore.QSSConfig+QuickStackConfig");
+                if (cfgType == null) return float.NaN;
 
-                var player = __0 ?? Player.m_localPlayer;
-                if (player == null)
-                    return;
+                var field = AccessTools.Field(cfgType, "QuickStackToNearbyRange");
+                if (field == null) return float.NaN;
 
-                // movedCount <= 0 - смысла гонять логику нет
-                if (__1 <= 0)
-                {
-                    Dbg("QSS movedCount=0, skip drawers pass.");
-                    return;
-                }
+                var cfgEntry = field.GetValue(null);
+                if (cfgEntry == null) return float.NaN;
 
-                var inv = player.GetInventory();
-                if (inv == null)
-                    return;
+                var valProp = cfgEntry.GetType().GetProperty("Value", BindingFlags.Instance | BindingFlags.Public);
+                if (valProp == null) return float.NaN;
 
-                float radius = Mathf.Max(0f, CfgSearchRadius?.Value ?? 0f);
-                bool fillEmpty = CfgFillEmptyDrawers?.Value ?? false;
-
-                var drawers = GetDrawersInRange(player.transform.position, radius);
-                if (drawers.Count == 0)
-                {
-                    Dbg($"No drawers found in radius {radius}.");
-                    return;
-                }
-
-                // Snapshot drawer states from ZDO. Key: prefab|quality
-                var filledByKey = new Dictionary<string, List<DrawerState>>(StringComparer.Ordinal);
-                var empties = new List<DrawerState>();
-
-                foreach (var d in drawers)
-                {
-                    if (d == null || !d.IsValid())
-                        continue;
-
-                    var zdo = d.GetZDO();
-                    if (zdo == null)
-                        continue;
-
-                    string prefab = zdo.GetString("Prefab") ?? string.Empty;
-                    int quality = zdo.GetInt("Quality", 1);
-
-                    var st = new DrawerState(d, prefab, quality);
-
-                    if (string.IsNullOrEmpty(st.Prefab))
-                    {
-                        empties.Add(st);
-                        continue;
-                    }
-
-                    string k = MakeKey(st.Prefab, st.Quality);
-                    if (!filledByKey.TryGetValue(k, out var list))
-                    {
-                        list = new List<DrawerState>();
-                        filledByKey[k] = list;
-                    }
-                    list.Add(st);
-                }
-
-                var reservedEmpty = new Dictionary<string, DrawerState>(StringComparer.Ordinal);
-
-                int movedStacks = 0;
-                int movedItemsTotal = 0;
-
-                var items = inv.GetAllItems();
-                for (int i = items.Count - 1; i >= 0; i--)
-                {
-                    var item = items[i];
-                    if (item == null) continue;
-                    if (item.m_stack <= 0) continue;
-
-                    if (item.m_customData != null && item.m_customData.Count > 0)
-                    {
-                        Dbg($"Skip customData item: {item.m_shared?.m_name} ({item.m_dropPrefab?.name}) customData={item.m_customData.Count}");
-                        continue;
-                    }
-
-                    string? dropPrefabMaybe = item.m_dropPrefab?.name;
-                    if (string.IsNullOrEmpty(dropPrefabMaybe))
-                    {
-                        Dbg($"Item without valid dropPrefab skipped: {item.m_shared?.m_name}");
-                        continue;
-                    }
-
-                    string dropPrefab = dropPrefabMaybe;
-                    int q = item.m_quality;
-                    string key = MakeKey(dropPrefab, q);
-
-                    DrawerState? target = null;
-
-                    if (filledByKey.TryGetValue(key, out var candidates) && candidates.Count > 0)
-                    {
-                        target = SelectBestDrawer(candidates, player.transform.position);
-                    }
-
-                    if (target == null && fillEmpty)
-                    {
-                        if (!reservedEmpty.TryGetValue(key, out var reserved))
-                        {
-                            if (empties.Count == 0) continue;
-
-                            reserved = SelectBestDrawer(empties, player.transform.position) ?? empties[0];
-                            empties.Remove(reserved);
-                            reservedEmpty[key] = reserved;
-
-                            if (!filledByKey.TryGetValue(key, out var list))
-                            {
-                                list = new List<DrawerState>();
-                                filledByKey[key] = list;
-                            }
-                            list.Add(reserved);
-                        }
-
-                        target = reserved;
-                    }
-
-                    if (target == null) continue;
-
-                    int amount = item.m_stack;
-                    int prevAmount = target.NView.GetZDO()?.GetInt("Amount", 0) ?? 0;
-
-                    var backupItem = CloneItemData(item);
-                    if (backupItem == null)
-                    {
-                        Dbg($"Clone failed, skipping item: {dropPrefab} x{amount}");
-                        continue;
-                    }
-
-                    bool deposited = TryDepositToDrawer(player, inv, item, target.NView, dropPrefab, q, amount);
-                    if (!deposited) continue;
-
-                    movedStacks++;
-                    movedItemsTotal += amount;
-
-                    player.StartCoroutine(CheckPlacementCoroutine(
-                        drawerNView: target.NView,
-                        prefab: dropPrefab,
-                        quality: q,
-                        expectedAmount: amount,
-                        prevAmount: prevAmount,
-                        backupItem: backupItem,
-                        inv: inv,
-                        player: player));
-                }
-
-                if (movedStacks > 0)
-                {
-                    Dbg($"Deposited stacks={movedStacks} items={movedItemsTotal} (fillEmpty={fillEmpty}) radius={radius} drawers={drawers.Count}");
-                }
+                var v = valProp.GetValue(cfgEntry);
+                return v is float f ? f : float.NaN;
             }
-            catch (Exception ex)
+            catch
             {
-                Log?.LogError($"[ItemDrawersCompat] Postfix failed: {ex}");
+                return float.NaN;
             }
         }
 
-        private static IEnumerator CheckPlacementCoroutine(
-            ZNetView drawerNView,
-            string prefab,
-            int quality,
-            int expectedAmount,
-            int prevAmount,
-            ItemDrop.ItemData backupItem,
-            Inventory inv,
-            Player player)
+        private static Inventory? GetHumanoidInventory(Humanoid h)
         {
-            float delay = Mathf.Max(0f, CfgPlacementCheckDelay?.Value ?? 0.5f);
-            yield return new WaitForSeconds(delay);
+            // В разных версиях Valheim это бывает:
+            // - protected field m_inventory
+            // - публичный метод GetInventory()
+            // Поэтому пробуем обе стратегии.
 
             try
             {
-                if (drawerNView == null || !drawerNView.IsValid())
-                    yield break;
-
-                var zdo = drawerNView.GetZDO();
-                if (zdo == null)
-                    yield break;
-
-                string currentPrefab = zdo.GetString("Prefab") ?? string.Empty;
-                int currentQuality = zdo.GetInt("Quality", 1);
-                int currentAmount = zdo.GetInt("Amount", 0);
-
-                bool sameType = currentPrefab == prefab && currentQuality == quality;
-                int delta = currentAmount - prevAmount;
-
-                if (!sameType || delta <= 0)
+                _getInventoryMethod ??= AccessTools.Method(h.GetType(), "GetInventory", Type.EmptyTypes);
+                if (_getInventoryMethod != null)
                 {
-                    Dbg($"Placement failed for {prefab} x{expectedAmount} (delta={delta}, sameType={sameType}). Recovering full.");
-                    RecoverItem(player, inv, backupItem, expectedAmount);
-                    yield break;
+                    var res = _getInventoryMethod.Invoke(h, Array.Empty<object>());
+                    if (res is Inventory invA) return invA;
                 }
-
-                if (delta < expectedAmount)
-                {
-                    int remaining = expectedAmount - delta;
-                    Dbg($"Placement partial for {prefab}: expected={expectedAmount}, delta={delta}. Recovering remaining={remaining}.");
-                    RecoverItem(player, inv, backupItem, remaining);
-                    yield break;
-                }
-
-                Dbg($"Placement OK for {prefab} x{expectedAmount} (delta={delta}).");
             }
-            catch (Exception ex)
+            catch { }
+
+            try
             {
-                Log?.LogError($"[ItemDrawersCompat] Placement check failed: {ex}");
-                RecoverItem(player, inv, backupItem, expectedAmount);
+                _inventoryField ??= AccessTools.Field(h.GetType(), "m_inventory");
+                if (_inventoryField != null)
+                {
+                    var res = _inventoryField.GetValue(h);
+                    if (res is Inventory invB) return invB;
+                }
             }
+            catch { }
+
+            return null;
         }
 
-        private static void RecoverItem(Player player, Inventory inv, ItemDrop.ItemData templateItem, int amount)
+        private static bool IsHotbarItem(ItemDrop.ItemData item)
         {
-            if (amount <= 0) return;
-
+            // m_gridPos - Vector2i. Не ссылаемся на тип, читаем через reflection
             try
             {
-                var recovered = CloneItemData(templateItem);
-                if (recovered == null) return;
+                var f = AccessTools.Field(item.GetType(), "m_gridPos");
+                if (f == null) return false;
 
-                recovered.m_stack = amount;
+                var gp = f.GetValue(item);
+                if (gp == null) return false;
 
-                if (!inv.AddItem(recovered))
-                {
-                    Vector3 dropPos = player.transform.position + player.transform.forward * 1.5f + Vector3.up * 0.5f;
-                    Quaternion dropRot = Quaternion.LookRotation(player.transform.forward);
+                var yField = gp.GetType().GetField("y", BindingFlags.Instance | BindingFlags.Public);
+                if (yField == null) return false;
 
-                    ItemDrop dropped = ItemDrop.DropItem(recovered, amount, dropPos, dropRot);
-                    if (dropped != null) dropped.OnPlayerDrop();
-
-                    player.Message(MessageHud.MessageType.Center, "Inventory full: dropped recovered item.");
-                }
+                var yVal = yField.GetValue(gp);
+                return yVal is int y && y == 0;
             }
-            catch (Exception ex)
+            catch
             {
-                Log?.LogError($"[ItemDrawersCompat] RecoverItem failed: {ex}");
-            }
-        }
-
-        private static List<ZNetView> GetDrawersInRange(Vector3 pos, float range)
-        {
-            var result = new List<ZNetView>();
-
-            try
-            {
-                if (_miAllDrawers == null)
-                    return result;
-
-                if (_miAllDrawers.Invoke(null, null) is not List<ZNetView> raw)
-                    return result;
-
-                if (range <= 0f)
-                    return raw.Where(z => z != null && z.IsValid()).ToList();
-
-                float r2 = range * range;
-                foreach (var znv in raw)
-                {
-                    if (znv == null || !znv.IsValid())
-                        continue;
-
-                    var p = znv.transform.position;
-                    if ((p - pos).sqrMagnitude <= r2)
-                        result.Add(znv);
-                }
-            }
-            catch (Exception ex)
-            {
-                Log?.LogError($"[ItemDrawersCompat] GetDrawersInRange failed: {ex}");
-            }
-
-            return result;
-        }
-
-        private static bool TryDepositToDrawer(
-            Player player,
-            Inventory inv,
-            ItemDrop.ItemData item,
-            ZNetView drawerNView,
-            string prefab,
-            int quality,
-            int amount)
-        {
-            try
-            {
-                if (drawerNView == null || !drawerNView.IsValid())
-                    return false;
-
-                if (string.IsNullOrEmpty(prefab))
-                    return false;
-
-                if (amount <= 0)
-                    return false;
-
-                // MP: часто без владельца сервер отклоняет RPC
-                drawerNView.ClaimOwnership();
-
-                inv.RemoveItem(item);
-                drawerNView.InvokeRPC("AddItem_Request", prefab, amount, quality);
-
-                return true;
-            }
-            catch (Exception ex)
-            {
-                Log?.LogWarning($"[ItemDrawersCompat] Deposit failed for {prefab} x{amount} q{quality}: {ex}");
-
-                // Best-effort immediate recovery using same instance
-                try
-                {
-                    item.m_stack = amount;
-                    if (!inv.AddItem(item))
-                    {
-                        Vector3 dropPos = player.transform.position + player.transform.forward * 1.5f + Vector3.up * 0.5f;
-                        Quaternion dropRot = Quaternion.LookRotation(player.transform.forward);
-
-                        ItemDrop dropped = ItemDrop.DropItem(item, amount, dropPos, dropRot);
-                        if (dropped != null) dropped.OnPlayerDrop();
-                    }
-                }
-                catch (Exception rex)
-                {
-                    Log?.LogError($"[ItemDrawersCompat] Immediate recovery failed: {rex}");
-                }
-
                 return false;
             }
         }
 
-        private static DrawerState? SelectBestDrawer(List<DrawerState> candidates, Vector3 playerPos)
-        {
-            if (candidates.Count == 0) return null;
-            if (candidates.Count == 1) return candidates[0];
-
-            return candidates
-                .OrderBy(d => (d.NView.transform.position - playerPos).sqrMagnitude)
-                .FirstOrDefault();
-        }
-
-        private static string MakeKey(string prefab, int quality) => prefab + "|" + quality;
-
-        private static void Dbg(string msg)
-        {
-            if (CfgDebug?.Value != true) return;
-            Log?.LogInfo("[ItemDrawersCompat][DBG] " + msg);
-        }
-
-        private static ItemDrop.ItemData? CloneItemData(ItemDrop.ItemData src)
+        private static string ReadCurrentPrefab(Component drawerComp)
         {
             try
             {
-                if (MemberwiseCloneMethod == null)
-                    return null;
-
-                return (ItemDrop.ItemData)MemberwiseCloneMethod.Invoke(src, Array.Empty<object>());
+                if (_piCurrentPrefab == null) return string.Empty;
+                return _piCurrentPrefab.GetValue(drawerComp) as string ?? string.Empty;
             }
-            catch (Exception ex)
+            catch
             {
-                Log?.LogError($"[ItemDrawersCompat] CloneItemData failed: {ex}");
-                return null;
+                return string.Empty;
             }
         }
 
-        private sealed class DrawerState
+        private static int ReadCurrentAmount(Component drawerComp)
         {
-            public ZNetView NView { get; }
-            public string Prefab { get; }
-            public int Quality { get; }
-
-            public DrawerState(ZNetView nview, string prefab, int quality)
+            try
             {
-                NView = nview;
-                Prefab = prefab;
-                Quality = quality;
+                if (_piCurrentAmount == null) return 0;
+                var v = _piCurrentAmount.GetValue(drawerComp);
+                return v is int i ? i : 0;
+            }
+            catch
+            {
+                return 0;
+            }
+        }
+
+        private readonly struct DrawerInfo
+        {
+            public readonly Component Comp;
+            public readonly float Distance;
+            public readonly string CurrentPrefab;
+            public readonly int CurrentAmount;
+
+            public DrawerInfo(Component comp, float dist, string currentPrefab, int currentAmount)
+            {
+                Comp = comp;
+                Distance = dist;
+                CurrentPrefab = currentPrefab;
+                CurrentAmount = currentAmount;
             }
         }
     }
