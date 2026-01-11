@@ -1,0 +1,58 @@
+﻿<Project Sdk="Microsoft.NET.Sdk">
+
+  <PropertyGroup>
+    <TargetFramework>net48</TargetFramework>
+    <AssemblyName>QuickStackStore.ItemDrawersCompat</AssemblyName>
+    <RootNamespace>QuickStackStoreItemDrawersCompat</RootNamespace>
+    <LangVersion>latest</LangVersion>
+    <Nullable>disable</Nullable>
+
+    <!-- Чтобы не тащить dll'ки в выходную папку -->
+    <CopyLocalLockFileAssemblies>false</CopyLocalLockFileAssemblies>
+
+    <!-- Удобно видеть warnings -->
+    <TreatWarningsAsErrors>false</TreatWarningsAsErrors>
+
+    <!-- Можно билдить: dotnet build -c Release -p:GamePath="C:\...\Valheim" -->
+    <GamePath Condition="'$(GamePath)'==''">C:\Program Files (x86)\Steam\steamapps\common\Valheim</GamePath>
+  </PropertyGroup>
+
+  <ItemGroup>
+    <!-- BepInEx + Harmony -->
+    <Reference Include="BepInEx">
+      <HintPath>$(GamePath)\BepInEx\core\BepInEx.dll</HintPath>
+      <Private>false</Private>
+    </Reference>
+
+    <Reference Include="0Harmony">
+      <HintPath>$(GamePath)\BepInEx\core\0Harmony.dll</HintPath>
+      <Private>false</Private>
+    </Reference>
+
+    <!-- Unity / Valheim -->
+    <Reference Include="UnityEngine">
+      <HintPath>$(GamePath)\valheim_Data\Managed\UnityEngine.dll</HintPath>
+      <Private>false</Private>
+    </Reference>
+
+    <Reference Include="UnityEngine.CoreModule">
+      <HintPath>$(GamePath)\valheim_Data\Managed\UnityEngine.CoreModule.dll</HintPath>
+      <Private>false</Private>
+    </Reference>
+
+    <Reference Include="assembly_valheim">
+      <HintPath>$(GamePath)\valheim_Data\Managed\assembly_valheim.dll</HintPath>
+      <Private>false</Private>
+    </Reference>
+  </ItemGroup>
+
+  <Target Name="ValidateGamePath" BeforeTargets="ResolveReferences">
+    <Error Condition="!Exists('$(GamePath)\valheim_Data\Managed\assembly_valheim.dll')"
+           Text="GamePath is invalid. Provide -p:GamePath=&quot;C:\Path\To\Valheim&quot; (must contain valheim_Data\Managed\assembly_valheim.dll). Current: $(GamePath)" />
+    <Error Condition="!Exists('$(GamePath)\BepInEx\core\BepInEx.dll')"
+           Text="BepInEx.dll not found. Check that BepInEx is installed and GamePath is correct. Current: $(GamePath)" />
+    <Error Condition="!Exists('$(GamePath)\BepInEx\core\0Harmony.dll')"
+           Text="0Harmony.dll not found in BepInEx\core. Check BepInEx install. Current: $(GamePath)" />
+  </Target>
+
+</Project>
