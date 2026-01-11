@@ -1,0 +1,11 @@
+{
+  "name": "QuickStackStore_ItemDrawers_Compat",
+  "version_number": "1.0.2",
+  "website_url": "https://github.com/yourname/QuickStackStore-ItemDrawers-Compat",
+  "description": "Adds ItemDrawers support to QuickStackStore",
+  "dependencies": [
+    "denikson-BepInExPack_Valheim-5.4.2202",
+    "goldenrevolver-QuickStackStore-1.3.0",
+    "kg-ItemDrawers-1.1.0"
+  ]
+}
